@@ -1,20 +1,19 @@
 # PTMD — PDF To Markdown
 
-Rust CLI that converts text-based PDFs to GitHub-Flavored Markdown using [anydoc](https://crates.io/crates/anydoc) (Firecrawl, pure Rust via `pdf-inspector`), with OCR fallback for scanned/image-only pages via [faster-paddle](https://pypi.org/project/faster-paddle/) (small model).
+Rust CLI that converts PDFs to Markdown using [pdf-inspector](https://crates.io/crates/pdf-inspector) (Firecrawl, pure Rust, lopdf), with OCR fallback for scanned/image-only pages via [faster-paddle](https://pypi.org/project/faster-paddle/) (small model).
 
 ## Pipeline
 
 ```
 PDF
   │
-  ├─► anydoc::to_markdown()     → full text → Markdown (if all text-based)
+  ├─► pdf_inspector::extract_pages_markdown_mem()
+  │     → per-page markdown + needs_ocr flag (~10-50ms classification)
   │
-  └─► ConvertError::NeedsOcr
-        │
-        ├─► text pages:  pdfseparate → anydoc (per-page)
-        └─► image pages: pdftoppm → faster-paddle OCR (small)
-              │
-              └─► combine all pages → document.md
+  ├─► text pages:  use extracted markdown directly
+  ├─► image pages: pdftoppm → faster-paddle OCR (small model)
+  │
+  └─► combine all pages → document.md
 ```
 
 ## Usage
@@ -32,14 +31,13 @@ cargo build --release
 
 Output:
 - `document.md` — combined Markdown with `<!-- PAGE N -->` markers
-- `manifest.json` — source hash (SHA256), page count, native/OCR breakdown
+- `manifest.json` — source hash (SHA256), page count, native/OCR breakdown, pdf_type
 
 ## Dependencies
 
-- **anydoc** 0.2 (Rust crate) — text-based PDF extraction via pdf-inspector
+- **pdf-inspector** 1.x (Rust crate) — PDF classification, per-page text extraction, Markdown conversion
 - **faster-paddle** (Python) — OCR for image-only pages, small model
 - **pdftoppm** (poppler) — render PDF pages to PNG for OCR
-- **pdfseparate** (poppler) — split single pages for per-page anydoc extraction
 
 ## Install Python OCR dependency
 
