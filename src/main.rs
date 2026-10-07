@@ -1,6 +1,13 @@
 // PTMD — PDF To Markdown
-// Text extraction via anydoc (Firecrawl, pure Rust, pdf-inspector for PDF).
-// OCR fallback via faster-paddle (small model) for image-only pages.
+// Detection via pdf_inspector (Firecrawl, pure Rust) — classifies TextBased/Scanned/ImageBased/Mixed
+// with per-page OCR reasons. Text extraction via anydoc. OCR fallback via faster-paddle (small).
+//
+// For mixed PDFs (common in Indonesian Tbk financial reports):
+//   1. classify_pdf_mem() → PdfType + pages_needing_ocr (~10-50ms)
+//   2. Text pages → anydoc::to_markdown() on single-page extract
+//   3. OCR pages → faster-paddle (small model)
+//   4. Combine → document.md
+//
 // Usage: ptmd --pdf <path> --outdir <dir> [--dpi 150]
 
 use std::collections::BTreeMap;
@@ -23,6 +30,8 @@ struct Manifest {
     dpi: u32,
     converted_at: String,
     engine: String,
+    pdf_type: String,
+    ocr_reasons: BTreeMap<usize, Vec<String>>,
 }
 
 fn main() {
@@ -56,63 +65,69 @@ fn main() {
     fs::create_dir_all(&outdir_path).unwrap();
 
     let source_hash = hash_file(pdf).expect("hash failed");
-    let page_count = get_page_count(pdf).unwrap_or(0);
-    eprintln!("Pages: {}", page_count);
+    let bytes = fs::read(pdf).expect("read pdf");
 
-    // Try anydoc on the full PDF first
-    match anydoc::to_markdown(&pdf_path) {
-        Ok(md) => {
-            // All text — no OCR needed
-            eprintln!("anydoc: OK (all text, no OCR needed)");
-            let md_path = outdir_path.join("document.md");
-            fs::write(&md_path, &md).expect("write document.md");
-
-            let manifest = Manifest {
-                source_hash,
-                page_count,
-                native_pages: page_count,
-                ocr_pages: 0,
-                dpi,
-                converted_at: chrono_now(),
-                engine: "anydoc".to_string(),
-            };
-            write_manifest(&outdir_path, &manifest);
-            eprintln!("PTMD bundle ready at: {}", outdir);
-            eprintln!("  pages: {} (native: {}, ocr: 0)", page_count, page_count);
-            return;
-        }
-        Err(anydoc::ConvertError::NeedsOcr { pages, .. }) => {
-            eprintln!("anydoc: NeedsOcr — {} pages need OCR: {:?}", pages.len(), pages);
-            let pages_usize: Vec<usize> = pages.iter().map(|&p| p as usize).collect();
-            let combined = handle_mixed_pdf(&pdf_path, page_count, &pages_usize, dpi);
-            let native_pages = page_count - pages.len();
-
-            let md_path = outdir_path.join("document.md");
-            fs::write(&md_path, &combined).expect("write document.md");
-
-            let manifest = Manifest {
-                source_hash,
-                page_count,
-                native_pages,
-                ocr_pages: pages.len(),
-                dpi,
-                converted_at: chrono_now(),
-                engine: "anydoc+faster-paddle".to_string(),
-            };
-            write_manifest(&outdir_path, &manifest);
-            eprintln!("PTMD bundle ready at: {}", outdir);
-            eprintln!("  pages: {} (native: {}, ocr: {})", page_count, native_pages, pages.len());
-            return;
-        }
+    // 1. Classify via pdf_inspector (~10-50ms)
+    let classification = match pdf_inspector::classify_pdf_mem(&bytes) {
+        Ok(c) => c,
         Err(e) => {
-            eprintln!("anydoc failed: {:?}", e);
-            std::process::exit(2);
+            eprintln!("pdf_inspector classify failed: {:?}, trying anydoc directly", e);
+            match anydoc::to_markdown(&pdf_path) {
+                Ok(md) => {
+                    write_output(&outdir_path, &md, &Manifest {
+                        source_hash, page_count: 0, native_pages: 0, ocr_pages: 0,
+                        dpi, converted_at: chrono_now(), engine: "anydoc".into(),
+                        pdf_type: "TextBased".into(), ocr_reasons: BTreeMap::new(),
+                    });
+                    return;
+                }
+                Err(e) => { eprintln!("anydoc also failed: {:?}", e); std::process::exit(2); }
+            }
+        }
+    };
+
+    let pdf_type = format!("{:?}", classification.pdf_type);
+    let page_count: usize = classification.page_count as usize;
+    eprintln!("pdf_inspector: type={} pages={}", pdf_type, page_count);
+
+    let ocr_pages: Vec<usize> = classification.pages_needing_ocr
+        .iter().map(|&p| p as usize + 1).collect(); // 0-indexed → 1-indexed
+
+    eprintln!("pdf_inspector: type={} pages={} ocr_pages={:?} confidence={:.2}",
+        pdf_type, page_count, ocr_pages, classification.confidence);
+
+    match classification.pdf_type {
+        pdf_inspector::PdfType::TextBased => {
+            eprintln!("  → TextBased: extracting via anydoc");
+            let md = anydoc::to_markdown(&pdf_path)
+                .unwrap_or_else(|e| {
+                    eprintln!("anydoc failed: {:?}, trying pdf_inspector extract", e);
+                    extract_via_pdf_inspector(&bytes, page_count as u32)
+                });
+            write_output(&outdir_path, &md, &Manifest {
+                source_hash, page_count, native_pages: page_count, ocr_pages: 0,
+                dpi, converted_at: chrono_now(), engine: "anydoc".into(),
+                pdf_type, ocr_reasons: BTreeMap::new(),
+            });
+        }
+        _ => {
+            eprintln!("  → {:?}: {} pages need OCR", classification.pdf_type, ocr_pages.len());
+            for &p in &ocr_pages {
+                eprintln!("    page {} needs OCR", p);
+            }
+            let md = handle_mixed(&pdf_path, page_count, &ocr_pages, dpi);
+            let native = page_count - ocr_pages.len();
+            write_output(&outdir_path, &md, &Manifest {
+                source_hash, page_count, native_pages: native, ocr_pages: ocr_pages.len(),
+                dpi, converted_at: chrono_now(), engine: "anydoc+faster-paddle".into(),
+                pdf_type, ocr_reasons: BTreeMap::new(),
+            });
         }
     }
 }
 
-/// Handle mixed PDF: text pages via anydoc, OCR pages via faster-paddle.
-fn handle_mixed_pdf(pdf_path: &str, page_count: usize, ocr_pages: &[usize], dpi: u32) -> String {
+/// Handle mixed/scanned PDF: text pages via anydoc, OCR pages via faster-paddle.
+fn handle_mixed(pdf_path: &str, page_count: usize, ocr_pages: &[usize], dpi: u32) -> String {
     let ocr_set: std::collections::HashSet<usize> = ocr_pages.iter().copied().collect();
     let script_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/ocr_page.py");
     let tmpdir = std::env::temp_dir().join(format!("ptmd_{}", std::process::id()));
@@ -120,18 +135,14 @@ fn handle_mixed_pdf(pdf_path: &str, page_count: usize, ocr_pages: &[usize], dpi:
 
     let mut page_texts: BTreeMap<usize, String> = BTreeMap::new();
 
-    // Extract each page as a single-page PDF, then run anydoc on text pages
-    // and faster-paddle on OCR pages
     for page_num in 1..=page_count {
         if ocr_set.contains(&page_num) {
-            // OCR page: render to image + faster-paddle
             let result = Command::new("python3")
                 .arg(&script_path)
                 .arg(pdf_path)
                 .arg(page_num.to_string())
                 .arg(dpi.to_string())
                 .output();
-
             match result {
                 Ok(out) if out.status.success() => {
                     page_texts.insert(page_num, String::from_utf8_lossy(&out.stdout).to_string());
@@ -146,7 +157,7 @@ fn handle_mixed_pdf(pdf_path: &str, page_count: usize, ocr_pages: &[usize], dpi:
                 }
             }
         } else {
-            // Text page: extract as single-page PDF → anydoc
+            // Text page: extract single-page PDF → anydoc
             let prefix = tmpdir.join("page");
             let _ = Command::new("pdfseparate")
                 .arg("-f").arg(page_num.to_string())
@@ -155,27 +166,23 @@ fn handle_mixed_pdf(pdf_path: &str, page_count: usize, ocr_pages: &[usize], dpi:
                 .arg(prefix.to_str().unwrap())
                 .output();
 
-            // pdfseparate creates page-N.pdf (or page-N-N.pdf) — find it
             let expected_name = format!("page-{}.pdf", page_num);
             let single = tmpdir.join(&expected_name);
-            // Also try page-N-N.pdf format
             let alt_name = format!("page-{}-{}.pdf", page_num, page_num);
             let alt = tmpdir.join(&alt_name);
             let single = if single.exists() { single } else if alt.exists() { alt } else { single.clone() };
+
             if single.exists() {
                 match anydoc::to_markdown(single.to_str().unwrap()) {
                     Ok(md) => { page_texts.insert(page_num, md); }
                     Err(e) => {
                         eprintln!("  anydoc failed page {}: {:?}, trying pdftotext", page_num, e);
-                        // Fallback to pdftotext for this page
                         let r = Command::new("pdftotext")
                             .arg("-f").arg(page_num.to_string())
                             .arg("-l").arg(page_num.to_string())
-                            .arg(pdf_path)
-                            .arg("-")
-                            .output();
-                        if r.is_ok() {
-                            page_texts.insert(page_num, String::from_utf8_lossy(&r.unwrap().stdout).to_string());
+                            .arg(pdf_path).arg("-").output();
+                        if let Ok(out) = r {
+                            page_texts.insert(page_num, String::from_utf8_lossy(&out.stdout).to_string());
                         } else {
                             page_texts.insert(page_num, String::new());
                         }
@@ -183,15 +190,12 @@ fn handle_mixed_pdf(pdf_path: &str, page_count: usize, ocr_pages: &[usize], dpi:
                 }
                 let _ = fs::remove_file(&single);
             } else {
-                // pdfseparate might have failed, try pdftotext
                 let r = Command::new("pdftotext")
                     .arg("-f").arg(page_num.to_string())
                     .arg("-l").arg(page_num.to_string())
-                    .arg(pdf_path)
-                    .arg("-")
-                    .output();
-                if r.is_ok() {
-                    page_texts.insert(page_num, String::from_utf8_lossy(&r.unwrap().stdout).to_string());
+                    .arg(pdf_path).arg("-").output();
+                if let Ok(out) = r {
+                    page_texts.insert(page_num, String::from_utf8_lossy(&out.stdout).to_string());
                 } else {
                     page_texts.insert(page_num, String::new());
                 }
@@ -199,10 +203,8 @@ fn handle_mixed_pdf(pdf_path: &str, page_count: usize, ocr_pages: &[usize], dpi:
         }
     }
 
-    // Cleanup
     let _ = fs::remove_dir_all(&tmpdir);
 
-    // Combine with page markers
     let mut document_md = String::new();
     for page_num in 1..=page_count {
         let text = page_texts.get(&page_num).cloned().unwrap_or_default();
@@ -211,10 +213,34 @@ fn handle_mixed_pdf(pdf_path: &str, page_count: usize, ocr_pages: &[usize], dpi:
     document_md
 }
 
-fn write_manifest(outdir: &Path, manifest: &Manifest) {
-    let path = outdir.join("manifest.json");
-    fs::write(&path, serde_json::to_string_pretty(manifest).unwrap())
-        .expect("write manifest.json");
+fn extract_via_pdf_inspector(bytes: &[u8], page_count: u32) -> String {
+    match pdf_inspector::process_pdf_mem(bytes) {
+        Ok(result) => result.markdown.unwrap_or_default(),
+        Err(_) => {
+            let mut md = String::new();
+            for p in 1..=page_count {
+                let r = std::process::Command::new("pdftotext")
+                    .arg("-f").arg(p.to_string())
+                    .arg("-l").arg(p.to_string())
+                    .arg("-")
+                    .output();
+                if let Ok(out) = r {
+                    md.push_str(&format!("<!-- PAGE {} -->\n\n{}\n\n", p,
+                        String::from_utf8_lossy(&out.stdout).trim()));
+                }
+            }
+            md
+        }
+    }
+}
+
+fn write_output(outdir: &Path, md: &str, manifest: &Manifest) {
+    fs::write(outdir.join("document.md"), md).expect("write document.md");
+    fs::write(outdir.join("manifest.json"),
+        serde_json::to_string_pretty(manifest).unwrap()).expect("write manifest.json");
+    eprintln!("PTMD bundle ready at: {}", outdir.display());
+    eprintln!("  type: {} | pages: {} (native: {}, ocr: {})",
+        manifest.pdf_type, manifest.page_count, manifest.native_pages, manifest.ocr_pages);
 }
 
 fn hash_file(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
@@ -227,17 +253,6 @@ fn hash_file(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
         hasher.update(&buf[..n]);
     }
     Ok(format!("{:x}", hasher.finalize()))
-}
-
-fn get_page_count(pdf: &Path) -> Option<usize> {
-    let out = Command::new("pdfinfo").arg(pdf).output().ok()?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    for line in stdout.lines() {
-        if line.starts_with("Pages:") {
-            return line.split(':').nth(1).and_then(|s| s.trim().parse().ok());
-        }
-    }
-    None
 }
 
 fn chrono_now() -> String {
